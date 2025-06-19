@@ -1,0 +1,36 @@
+feat: Implement Modbus RTU/CAN J1939 gateway with WiFi provisioning
+
+- Add complete gateway implementation for industrial engine monitoring
+- Implement Modbus RTU slave functionality on RS485 interface
+- Add CAN J1939 protocol support for engine data acquisition
+- Include WiFi provisioning with captive portal for easy setup
+- Add web interface for real-time data monitoring and configuration
+- Support persistent storage of WiFi and Modbus settings
+
+Key features:
+- Read engine parameters via CAN J1939 (RPM, temperatures, pressures, etc.)
+- Expose data through Modbus RTU holding registers (21 registers total)
+- Web dashboard with live data updates every 2 seconds
+- Configuration interface for WiFi credentials and Modbus parameters
+- Auto-provisioning: creates AP "Gateway_Setup" if no WiFi configured
+- Custom Modbus implementation without external libraries
+
+Hardware configuration:
+- RS485: TX=22, RX=21, EN=19, CALLBACK=17
+- CAN: TX=27, RX=26, SPEED_MODE=23
+- Power: ME2107_EN=16 (boost supply for RS485/CAN)
+- WS2812B: DATA=4 (status LED)
+- SD Card: MISO=2, MOSI=15, SCLK=14, CS=13
+
+Supported J1939 PGNs:
+- 0xF004: Engine Speed
+- 0xFEEE: Engine Temperature  
+- 0xFEFC: Engine Fluid Level/Pressure
+- 0xFEE5: Engine Hours
+- 0xFEF2: Fuel Economy
+- 0xFEF7: Vehicle Electrical Power
+- 0xF003: Electronic Engine Controller
+- 0xFECA: Diagnostic Messages (DM1)
+
+The gateway provides a complete solution for industrial engine monitoring
+and integration with SCADA systems via Modbus RTU protocol.

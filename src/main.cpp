@@ -1,21 +1,17 @@
 /*
  * @Description: Gateway Modbus RTU Slave - CAN J1939 con WiFi e Web Interface
- * Legge dati motore da CAN J1939, li espone tramite Modbus RTU su RS485
- * e fornisce interfaccia web per configurazione e monitoraggio
+ * Versione semplificata con implementazione Modbus custom
  * @Author: Your Name
  * @Date: 2024
  */
 
 #include <Arduino.h>
-#include <ModbusSlave.h>
 #include "driver/twai.h"
 
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <WebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <DNSServer.h>
 
 
 // RS485
@@ -41,7 +37,6 @@
 #define SD_SCLK 14
 #define SD_CS 13
 
-
 // Configurazione Modbus
 #define MODBUS_SLAVE_ID 1
 #define MODBUS_BAUDRATE 19200
@@ -50,6 +45,10 @@
 // Configurazione Access Point per provisioning
 #define AP_SSID "Gateway_Setup"
 #define AP_PASSWORD "12345678"
+
+// Codici funzione Modbus
+#define MB_FC_READ_HOLDING_REGISTERS 0x03
+#define MB_FC_READ_INPUT_REGISTERS   0x04
 
 // Registri Modbus (Holding Registers)
 #define MB_REG_ENGINE_RPM           0   // 2 registri (32-bit)
@@ -104,19 +103,21 @@ struct EngineData {
 } engineData;
 
 // Oggetti globali
-Modbus modbus(Serial1, MODBUS_SLAVE_ID);
-AsyncWebServer server(80);
-DNSServer dnsServer;
+WebServer server(80);
 Preferences preferences;
 
 // Buffer registri Modbus
 uint16_t modbusRegisters[MODBUS_REGISTERS_COUNT];
 
-// Variabili WiFi
+// Variabili configurazione
+uint8_t currentSlaveId = MODBUS_SLAVE_ID;
+uint32_t currentBaudrate = MODBUS_BAUDRATE;
 bool wifiConfigured = false;
-bool apMode = false;
 String ssid = "";
 String password = "";
+
+// Buffer Modbus
+uint8_t modbusBuffer[256];
 
 // HTML per pagina web
 const char index_html[] PROGMEM = R"rawliteral(
@@ -197,22 +198,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         button:hover {
             background-color: #45a049;
         }
-        .register-map {
-            margin-top: 20px;
-            font-size: 0.9em;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th, td {
-            border: 1px solid #ddd;
-            padding: 8px;
-            text-align: left;
-        }
-        th {
-            background-color: #f2f2f2;
-        }
     </style>
 </head>
 <body>
@@ -248,24 +233,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="data-value" id="coolantTemp">-</div>
             </div>
             <div class="data-item">
-                <div class="data-label">Temp. Aria Aspirazione</div>
-                <div class="data-value" id="intakeTemp">-</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">Temp. Gas Scarico</div>
-                <div class="data-value" id="exhaustTemp">-</div>
-            </div>
-            <div class="data-item">
                 <div class="data-label">Carico Motore</div>
                 <div class="data-value" id="engineLoad">-</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">Posizione Acceleratore</div>
-                <div class="data-value" id="throttlePos">-</div>
-            </div>
-            <div class="data-item">
-                <div class="data-label">Coppia Motore</div>
-                <div class="data-value" id="engineTorque">-</div>
             </div>
             <div class="data-item">
                 <div class="data-label">Tensione Batteria</div>
@@ -275,20 +244,16 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="data-label">Codici Errore Attivi</div>
                 <div class="data-value" id="dtcCount">-</div>
             </div>
-            <div class="data-item">
-                <div class="data-label">Ultimo Aggiornamento</div>
-                <div class="data-value" id="lastUpdate">-</div>
-            </div>
         </div>
         
         <div class="config-section">
             <h3>Configurazione WiFi</h3>
-            <form id="wifiForm">
+            <form action="/wifi" method="POST">
                 <label>SSID:</label>
-                <input type="text" id="ssid" name="ssid" required>
+                <input type="text" name="ssid" required>
                 
                 <label>Password:</label>
-                <input type="password" id="password" name="password">
+                <input type="password" name="password">
                 
                 <button type="submit">Salva Configurazione WiFi</button>
             </form>
@@ -296,12 +261,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         <div class="config-section">
             <h3>Configurazione Modbus</h3>
-            <form id="modbusForm">
+            <form action="/modbus" method="POST">
                 <label>Slave ID:</label>
-                <input type="number" id="slaveId" name="slaveId" min="1" max="247" value="1">
+                <input type="number" name="slaveId" min="1" max="247" value="1">
                 
                 <label>Baudrate:</label>
-                <select id="baudrate" name="baudrate">
+                <select name="baudrate">
                     <option value="9600">9600</option>
                     <option value="19200" selected>19200</option>
                     <option value="38400">38400</option>
@@ -311,34 +276,6 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 <button type="submit">Salva Configurazione Modbus</button>
             </form>
-        </div>
-        
-        <div class="register-map">
-            <h3>Mappa Registri Modbus</h3>
-            <table>
-                <tr>
-                    <th>Registro</th>
-                    <th>Descrizione</th>
-                    <th>Tipo</th>
-                    <th>Unità</th>
-                </tr>
-                <tr><td>0-1</td><td>RPM Motore</td><td>32-bit</td><td>RPM</td></tr>
-                <tr><td>2</td><td>Temperatura Motore</td><td>16-bit</td><td>°C × 10</td></tr>
-                <tr><td>3</td><td>Pressione Olio</td><td>16-bit</td><td>kPa</td></tr>
-                <tr><td>4-5</td><td>Consumo Carburante</td><td>32-bit</td><td>L/h × 100</td></tr>
-                <tr><td>6-7</td><td>Ore di Funzionamento</td><td>32-bit</td><td>ore</td></tr>
-                <tr><td>8</td><td>Temp. Liquido Raffreddamento</td><td>16-bit</td><td>°C × 10</td></tr>
-                <tr><td>9</td><td>Temp. Aria Aspirazione</td><td>16-bit</td><td>°C × 10</td></tr>
-                <tr><td>10</td><td>Temp. Gas Scarico</td><td>16-bit</td><td>°C × 10</td></tr>
-                <tr><td>11</td><td>Carico Motore</td><td>16-bit</td><td>%</td></tr>
-                <tr><td>12</td><td>Posizione Acceleratore</td><td>16-bit</td><td>%</td></tr>
-                <tr><td>13-14</td><td>Coppia Motore</td><td>32-bit</td><td>Nm</td></tr>
-                <tr><td>15</td><td>Tensione Batteria</td><td>16-bit</td><td>V × 10</td></tr>
-                <tr><td>16</td><td>Flag di Stato</td><td>16-bit</td><td>-</td></tr>
-                <tr><td>17</td><td>Flag Errori</td><td>16-bit</td><td>-</td></tr>
-                <tr><td>18</td><td>Numero Codici Errore</td><td>16-bit</td><td>-</td></tr>
-                <tr><td>19-20</td><td>Timestamp Ultimo Aggiornamento</td><td>32-bit</td><td>ms</td></tr>
-            </table>
         </div>
     </div>
     
@@ -356,11 +293,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     document.getElementById('fuelRate').textContent = (data.fuelRate / 100).toFixed(2) + ' L/h';
                     document.getElementById('engineHours').textContent = data.engineHours + ' h';
                     document.getElementById('coolantTemp').textContent = (data.coolantTemp / 10).toFixed(1) + ' °C';
-                    document.getElementById('intakeTemp').textContent = (data.intakeTemp / 10).toFixed(1) + ' °C';
-                    document.getElementById('exhaustTemp').textContent = (data.exhaustTemp / 10).toFixed(1) + ' °C';
                     document.getElementById('engineLoad').textContent = data.engineLoad + ' %';
-                    document.getElementById('throttlePos').textContent = data.throttlePos + ' %';
-                    document.getElementById('engineTorque').textContent = data.engineTorque + ' Nm';
                     document.getElementById('batteryVoltage').textContent = (data.batteryVoltage / 10).toFixed(1) + ' V';
                     document.getElementById('dtcCount').textContent = data.dtcCount;
                     
@@ -371,56 +304,15 @@ const char index_html[] PROGMEM = R"rawliteral(
                         statusText = 'Errore Comunicazione CAN';
                         statusClass = 'status-error';
                     } else {
-                        let timeSinceUpdate = Date.now() - data.lastUpdate;
-                        if (timeSinceUpdate < 1000) {
-                            statusText = 'Connesso';
-                            statusClass = 'status-ok';
-                        } else if (timeSinceUpdate < 5000) {
-                            statusText = 'Connesso (ritardo)';
-                            statusClass = 'status-warning';
-                        } else {
-                            statusText = 'Timeout Comunicazione';
-                            statusClass = 'status-error';
-                        }
+                        statusText = 'Connesso';
+                        statusClass = 'status-ok';
                     }
                     
                     document.getElementById('connectionStatus').innerHTML = 
                         '<span class="status ' + statusClass + '">' + statusText + '</span>';
-                    
-                    document.getElementById('lastUpdate').textContent = new Date(data.lastUpdate).toLocaleTimeString();
                 })
                 .catch(error => console.error('Error:', error));
         }
-        
-        // Gestione form WiFi
-        document.getElementById('wifiForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            fetch('/wifi', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.text())
-            .then(data => {
-                alert('Configurazione WiFi salvata. Il dispositivo si riavvierà.');
-                setTimeout(() => { location.reload(); }, 3000);
-            });
-        });
-        
-        // Gestione form Modbus
-        document.getElementById('modbusForm').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            fetch('/modbus', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.text())
-            .then(data => {
-                alert('Configurazione Modbus salvata. Il dispositivo si riavvierà.');
-                setTimeout(() => { location.reload(); }, 3000);
-            });
-        });
         
         // Carica dati iniziali
         updateData();
@@ -429,22 +321,21 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// Funzione per gestire richieste Modbus
-uint8_t readHoldingRegisters(uint8_t fc, uint16_t address, uint16_t length) {
-    // Aggiorna i registri con i dati correnti del motore
-    updateModbusRegisters();
-    
-    // Controlla limiti
-    if (address + length > MODBUS_REGISTERS_COUNT) {
-        return STATUS_ILLEGAL_DATA_ADDRESS;
-    }
-    
-    // Restituisci i dati richiesti
+// Calcola CRC16 Modbus
+uint16_t calculateCRC16(uint8_t *data, uint16_t length) {
+    uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < length; i++) {
-        modbus.writeRegisterToBuffer(i, modbusRegisters[address + i]);
+        crc ^= (uint16_t)data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x0001) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
     }
-    
-    return STATUS_OK;
+    return crc;
 }
 
 // Aggiorna registri Modbus con dati motore
@@ -485,6 +376,90 @@ void updateModbusRegisters() {
     // Timestamp ultimo aggiornamento (32-bit)
     modbusRegisters[MB_REG_LAST_UPDATE] = (engineData.lastUpdate >> 16) & 0xFFFF;
     modbusRegisters[MB_REG_LAST_UPDATE + 1] = engineData.lastUpdate & 0xFFFF;
+}
+
+// Processa richiesta Modbus
+void processModbusRequest() {
+    if (Serial1.available() < 8) return;  // Minimo 8 byte per una richiesta valida
+    
+    uint8_t request[256];
+    int len = 0;
+    
+    // Leggi tutti i byte disponibili
+    while (Serial1.available() && len < 256) {
+        request[len++] = Serial1.read();
+    }
+    
+    // Verifica CRC
+    uint16_t receivedCRC = (request[len-1] << 8) | request[len-2];
+    uint16_t calculatedCRC = calculateCRC16(request, len-2);
+    
+    if (receivedCRC != calculatedCRC) return;  // CRC errato
+    
+    // Verifica slave ID
+    if (request[0] != currentSlaveId) return;  // Non per noi
+    
+    // Processa in base al codice funzione
+    uint8_t functionCode = request[1];
+    uint16_t startAddress = (request[2] << 8) | request[3];
+    uint16_t quantity = (request[4] << 8) | request[5];
+    
+    switch (functionCode) {
+        case MB_FC_READ_HOLDING_REGISTERS:
+        case MB_FC_READ_INPUT_REGISTERS: {
+            // Verifica limiti
+            if (startAddress + quantity > MODBUS_REGISTERS_COUNT) {
+                // Invia eccezione
+                uint8_t exception[5];
+                exception[0] = currentSlaveId;
+                exception[1] = functionCode | 0x80;
+                exception[2] = 0x02;  // Illegal data address
+                uint16_t exceptionCrc = calculateCRC16(exception, 3);
+                exception[3] = exceptionCrc & 0xFF;
+                exception[4] = (exceptionCrc >> 8) & 0xFF;
+                Serial1.write(exception, 5);
+                return;
+            }
+            
+            // Aggiorna registri
+            updateModbusRegisters();
+            
+            // Prepara risposta
+            uint8_t response[256];
+            response[0] = currentSlaveId;
+            response[1] = functionCode;
+            response[2] = quantity * 2;  // Byte count
+            
+            // Copia dati registri
+            for (uint16_t i = 0; i < quantity; i++) {
+                uint16_t value = modbusRegisters[startAddress + i];
+                response[3 + i*2] = (value >> 8) & 0xFF;
+                response[3 + i*2 + 1] = value & 0xFF;
+            }
+            
+            // Calcola e aggiungi CRC
+            uint16_t responseCrc = calculateCRC16(response, 3 + quantity * 2);
+            response[3 + quantity * 2] = responseCrc & 0xFF;
+            response[3 + quantity * 2 + 1] = (responseCrc >> 8) & 0xFF;
+            
+            // Invia risposta
+            Serial1.write(response, 5 + quantity * 2);
+            break;
+        }
+            
+        default: {
+            // Funzione non supportata
+            uint8_t exception[5];
+            exception[0] = currentSlaveId;
+            exception[1] = functionCode | 0x80;
+            exception[2] = 0x01;  // Illegal function
+            uint16_t exceptionCrc = calculateCRC16(exception, 3);
+            exception[3] = exceptionCrc & 0xFF;
+            exception[4] = (exceptionCrc >> 8) & 0xFF;
+            Serial1.write(exception, 5);
+            break;
+        }
+    }
 }
 
 // Inizializza CAN bus per J1939
@@ -604,7 +579,7 @@ void processJ1939Message(twai_message_t &message) {
             if (message.data_length_code >= 3) {
                 engineData.engineLoad = message.data[2];
                 int16_t torque = message.data[1] - 125;
-                engineData.throttlePos = max(0, torque);  // Usa come indicazione acceleratore
+                engineData.throttlePos = max(0, (int)torque);  // Usa come indicazione acceleratore
                 engineData.lastUpdate = millis();
             }
             break;
@@ -647,67 +622,65 @@ void CAN_Task() {
 // Setup server web
 void setupWebServer() {
     // Pagina principale
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send_P(200, "text/html", index_html);
+    server.on("/", [](){
+        server.send_P(200, "text/html", index_html);
     });
     
     // API per dati in tempo reale
-    server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
-        DynamicJsonDocument doc(1024);
-        doc["rpm"] = engineData.rpm;
-        doc["engineTemp"] = engineData.engineTemp;
-        doc["oilPressure"] = engineData.oilPressure;
-        doc["fuelRate"] = engineData.fuelRate;
-        doc["engineHours"] = engineData.engineHours;
-        doc["coolantTemp"] = engineData.coolantTemp;
-        doc["intakeTemp"] = engineData.intakeTemp;
-        doc["exhaustTemp"] = engineData.exhaustTemp;
-        doc["engineLoad"] = engineData.engineLoad;
-        doc["throttlePos"] = engineData.throttlePos;
-        doc["engineTorque"] = engineData.engineTorque;
-        doc["batteryVoltage"] = engineData.batteryVoltage;
-        doc["statusFlags"] = engineData.statusFlags;
-        doc["errorFlags"] = engineData.errorFlags;
-        doc["dtcCount"] = engineData.dtcCount;
-        doc["lastUpdate"] = engineData.lastUpdate;
+    server.on("/data", [](){
+        String json = "{";
+        json += "\"rpm\":" + String(engineData.rpm) + ",";
+        json += "\"engineTemp\":" + String(engineData.engineTemp) + ",";
+        json += "\"oilPressure\":" + String(engineData.oilPressure) + ",";
+        json += "\"fuelRate\":" + String(engineData.fuelRate) + ",";
+        json += "\"engineHours\":" + String(engineData.engineHours) + ",";
+        json += "\"coolantTemp\":" + String(engineData.coolantTemp) + ",";
+        json += "\"intakeTemp\":" + String(engineData.intakeTemp) + ",";
+        json += "\"exhaustTemp\":" + String(engineData.exhaustTemp) + ",";
+        json += "\"engineLoad\":" + String(engineData.engineLoad) + ",";
+        json += "\"throttlePos\":" + String(engineData.throttlePos) + ",";
+        json += "\"engineTorque\":" + String(engineData.engineTorque) + ",";
+        json += "\"batteryVoltage\":" + String(engineData.batteryVoltage) + ",";
+        json += "\"statusFlags\":" + String(engineData.statusFlags) + ",";
+        json += "\"errorFlags\":" + String(engineData.errorFlags) + ",";
+        json += "\"dtcCount\":" + String(engineData.dtcCount) + ",";
+        json += "\"lastUpdate\":" + String(engineData.lastUpdate);
+        json += "}";
         
-        String response;
-        serializeJson(doc, response);
-        request->send(200, "application/json", response);
+        server.send(200, "application/json", json);
     });
     
     // Configurazione WiFi
-    server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-        if (request->hasParam("ssid", true)) {
-            ssid = request->getParam("ssid", true)->value();
-            password = request->hasParam("password", true) ? 
-                      request->getParam("password", true)->value() : "";
+    server.on("/wifi", HTTP_POST, [](){
+        if (server.hasArg("ssid")) {
+            ssid = server.arg("ssid");
+            password = server.hasArg("password") ? server.arg("password") : "";
             
             preferences.putString("ssid", ssid);
             preferences.putString("password", password);
             
-            request->send(200, "text/plain", "OK");
-            delay(1000);
+            server.send(200, "text/html", "<h1>Configurazione salvata!</h1><p>Il dispositivo si riavvierà...</p>");
+            delay(2000);
             ESP.restart();
         } else {
-            request->send(400, "text/plain", "Missing parameters");
+            server.send(400, "text/plain", "Parametri mancanti");
         }
     });
     
     // Configurazione Modbus
-    server.on("/modbus", HTTP_POST, [](AsyncWebServerRequest *request){
-        if (request->hasParam("slaveId", true) && request->hasParam("baudrate", true)) {
-            int slaveId = request->getParam("slaveId", true)->value().toInt();
-            int baudrate = request->getParam("baudrate", true)->value().toInt();
+    server.on("/modbus", HTTP_POST, [](){
+        if (server.hasArg("slaveId") && server.hasArg("baudrate")) {
+            currentSlaveId = server.arg("slaveId").toInt();
+            currentBaudrate = server.arg("baudrate").toInt();
             
-            preferences.putInt("slaveId", slaveId);
-            preferences.putInt("baudrate", baudrate);
+            preferences.putInt("slaveId", currentSlaveId);
+            preferences.putInt("baudrate", currentBaudrate);
             
-            request->send(200, "text/plain", "OK");
-            delay(1000);
+            server.send(200, "text/html", "<h1>Configurazione salvata!</h1><p>Il dispositivo si riavvierà...</p>");
+            delay(2000);
             ESP.restart();
         } else {
-            request->send(400, "text/plain", "Missing parameters");
+            server.send(400, "text/plain", "Parametri mancanti");
         }
     });
     
@@ -744,10 +717,6 @@ void setupWiFi() {
     Serial.println("\nStarting Access Point...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    apMode = true;
-    
-    // Avvia DNS server per captive portal
-    dnsServer.start(53, "*", WiFi.softAPIP());
     
     Serial.printf("AP Started. Connect to %s\n", AP_SSID);
     Serial.printf("IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -781,24 +750,19 @@ void setup() {
     CAN_J1939_Init();
     
     // Leggi configurazione Modbus
-    int savedSlaveId = preferences.getInt("slaveId", MODBUS_SLAVE_ID);
-    int savedBaudrate = preferences.getInt("baudrate", MODBUS_BAUDRATE);
+    currentSlaveId = preferences.getInt("slaveId", MODBUS_SLAVE_ID);
+    currentBaudrate = preferences.getInt("baudrate", MODBUS_BAUDRATE);
     
     // Inizializza Modbus RTU slave su Serial1 (RS485)
-    Serial1.begin(savedBaudrate, MODBUS_SERIAL_MODE, RS485_RX, RS485_TX);
-    modbus.begin(&Serial1);
-    modbus.slave(savedSlaveId);
-    
-    // Registra callback per lettura holding registers
-    modbus.cbVector[CB_READ_HOLDING_REGISTERS] = readHoldingRegisters;
+    Serial1.begin(currentBaudrate, MODBUS_SERIAL_MODE, RS485_RX, RS485_TX);
     
     // Setup WiFi e Web Server
     setupWiFi();
     setupWebServer();
     
     Serial.println("Gateway ready!");
-    Serial.printf("Modbus Slave ID: %d\n", savedSlaveId);
-    Serial.printf("Modbus Baudrate: %d\n", savedBaudrate);
+    Serial.printf("Modbus Slave ID: %d\n", currentSlaveId);
+    Serial.printf("Modbus Baudrate: %d\n", currentBaudrate);
     Serial.println("CAN J1939: 250 kbps");
     
     if (wifiConfigured) {
@@ -813,12 +777,10 @@ void loop() {
     CAN_Task();
     
     // Gestisci richieste Modbus
-    modbus.poll();
+    processModbusRequest();
     
-    // Gestisci DNS server se in AP mode
-    if (apMode) {
-        dnsServer.processNextRequest();
-    }
+    // Gestisci server web
+    server.handleClient();
     
     // Timeout dati - marca come non validi se troppo vecchi
     if (millis() - engineData.lastUpdate > 5000) {
